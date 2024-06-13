@@ -8,8 +8,7 @@ Data from the [duck facts API](https://03vpefsitf.execute-api.eu-west-1.amazonaw
 
 Wants to be on wifi to grab facts.
 
- - TODO: detect orientation
- - TODO: make it look nicer
- - TODO: add true/false options
- - TODO: add scroll / back / more facts
- - TODO: make it QUACK
+- TODO: make it look nicer
+  - icons
+- TODO: add scroll / back / more facts
+- TODO: make it QUACK
