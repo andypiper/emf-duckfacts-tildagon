@@ -12,3 +12,7 @@ Wants to be on wifi to grab facts.
   - icons
 - TODO: add scroll / back / more facts
 - TODO: make it QUACK
+
+This app has nothing to do with the following image. 
+
+[![Duck pond](https://tildagon.badge.emfcamp.org/images/hexpansions/duckpond.jpg)]
