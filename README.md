@@ -16,6 +16,7 @@ Wants to be on wifi to grab facts.
 - TODO: get latest @emfducks news
 - TODO: duck detector
 - TODO: make it QUACK...
+- TODO: handle feistyness and quackiness from API
 
 This app has nothing to do with the following image (but, a fully-functional duck #hexpansion must clearly be created before 2026).
 
@@ -28,4 +29,3 @@ MIT
 ## Contributions
 
 Yes, please.
-
