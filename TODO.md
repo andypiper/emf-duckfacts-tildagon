@@ -40,11 +40,8 @@ https://github.com/that-s-my-ducks/duck_fatcs/blob/main/public/app.js
 https://github.com/bjorn-knudsen/duck-facts-bot/blob/main/duck_facts.txt
 
 https://random-d.uk/api/randomimg
-
 https://random-d.uk/api
-
 https://random-d.uk/api/v2/quack
-
 
 -> https://toot.cat/@RandomHourlyDuckBot
 
@@ -54,5 +51,4 @@ https://duck-api.netlify.app/
 
 https://github.com/Tastypork/Duck-API
 
-https://caz-bee.itch.io/ducky-3
--- credit them and pay for this asset!
+
