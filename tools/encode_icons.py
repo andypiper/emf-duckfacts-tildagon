@@ -38,9 +38,10 @@ PALETTE = {"wh": [255, 255, 255]}
 ICONS = {
     "icon_bolt": "bolt.svg",
     "icon_confetti": "confetti.svg",
-    "icon_picture": "picture.svg",
     "icon_heart": "heart.svg",
     "icon_refresh": "refresh.svg",
+    "icon_binoculars": "binoculars.svg",
+    "icon_info": "info.svg",
 }
 
 

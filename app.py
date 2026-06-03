@@ -13,6 +13,7 @@ import requests
 import settings
 
 from app_components import Notification, clear_background
+from app_components.background import Background as bg
 from app_components.tokens import button_labels, label_font_size, small_font_size
 from app_components.utils import wrap_text
 from events.input import Buttons, BUTTON_TYPES
@@ -35,7 +36,7 @@ _FACT_URL = "https://03vpefsitf.execute-api.eu-west-1.amazonaws.com/prod/"
 _MASTODON_LOOKUP = "https://mastodon.social/api/v1/accounts/lookup?acct=emfducks"
 _MASTODON_STATUSES = (
     "https://mastodon.social/api/v1/accounts/{}/statuses"
-    "?limit=1&exclude_reblogs=true&exclude_replies=true"
+    "?limit=1&exclude_reblogs=true"
 )
 
 _FACT_WIDTH = 160
@@ -94,7 +95,7 @@ _NON_QUACK = ["*honk*", "*hiss*", "*whistle*", "*squeak*", "*coo*"]
 
 # Party mode themes for the DUCK PARTY lights screen.
 # Switch via: settings.set("duckfacts_party", "2024") / settings.save()
-# Default is "2026". "2024" is an easter egg (SOLAR POWER DUCK PARTY).
+# Default is "2026"
 _PARTY_2026 = "2026"
 _PARTY_2024 = "2024"  # easter egg
 
@@ -122,9 +123,12 @@ _MASTODON = "mastodon"
 _PHOTO = "photo"
 _LEDS = "leds"
 _FAVS = "favs"
+_CREDITS = "credits"
+_PROMPT_CLEAR = "prompt_clear"
 
 # Mastodon sub-pages ordered top to bottom (UP/DOWN navigate)
 _MASTO_PAGES = ["qr", "avatar", "content", "time"]
+_PHOTO_PAGES = ["image", "info"]
 
 # Exclusion zones for DUCK PARTY stars: (x_min, x_max, y_min, y_max)
 # Based on sprite scale=3, fh≈25, oy≈-47; label_font_size≈26px.
@@ -132,7 +136,7 @@ _MASTO_PAGES = ["qr", "avatar", "content", "time"]
 _STAR_EXCLUSIONS = (
     (-42, 42, -50, 30),  # duck sprite body
     (-77, 77, -82, -53),  # "DUCK PARTY" title
-    (-82, 82, 35, 62),  # subtitle (IN SPAAACE! / SOLAR POWER!)
+    (-82, 82, 35, 62),  # subtitle
 )
 
 
@@ -142,10 +146,6 @@ def _star_ok(x, y):
             return False
     return True
 
-
-_STUB_LABELS = {
-    _PHOTO: "Duck photo",
-}
 
 # ---------------------------------------------------------------------------
 # Asset path resolution
@@ -303,10 +303,29 @@ class DuckFactsApp(app.App):
         self._should_fetch = False
         self._fetching_mastodon = False
         self._should_fetch_mastodon = False
+        self._fetching_photo = False
+        self._should_fetch_photo = False
+        self._photo_path = settings.get("duckfacts_photo_path", _ASSET_PATH + "duck_photo.jpg")
+        self._photo_title = settings.get("duckfacts_photo_title", "Rubber Duck")
+        self._photo_description = settings.get("duckfacts_photo_description", "A rubber duck render")
+        self._photo_attribution = settings.get("duckfacts_photo_attribution", "starwatchers-studio")
+        self._photo_license = settings.get("duckfacts_photo_license", "CC0")
+        self._photo_sub = "image"
+        self._photo_wrapped_title = None
+        self._photo_title_font = small_font_size
+        self._photo_wrapped_attrib = None
+        self._photo_attrib_font = small_font_size
+        self._photo_wrapped_desc = None
+        self._photo_desc_font = small_font_size
 
-        # Long-press for favourites
+        # Long-press for favourites / systems
         self._confirm_hold_ms = 0
         self._confirm_was_held = False
+        self._left_hold_ms = 0
+        self._left_was_held = False
+        self._up_hold_ms = 0
+        self._up_was_held = False
+        self._credits_page = 0
 
         # Shake-to-fact (local facts)
         self._shake_cooldown = 0
@@ -406,9 +425,10 @@ class DuckFactsApp(app.App):
         self._qr_sprite = _load_sprite("emfducks_qr.json.gz")
         self._icon_bolt = _load_sprite("icon_bolt.json.gz")
         self._icon_confetti = _load_sprite("icon_confetti.json.gz")
-        self._icon_picture = _load_sprite("icon_picture.json.gz")
+        self._icon_binoculars = _load_sprite("icon_binoculars.json.gz")
         self._icon_heart = _load_sprite("icon_heart.json.gz")
         self._icon_refresh = _load_sprite("icon_refresh.json.gz")
+        self._icon_info = _load_sprite("icon_info.json.gz")
 
         # Favourites
         self._fav_facts = _load_favs()
@@ -439,6 +459,12 @@ class DuckFactsApp(app.App):
             if self._should_fetch_mastodon and not self._fetching_mastodon:
                 self._should_fetch_mastodon = False
                 await self._fetch_mastodon(render_update)
+                last_time = time.ticks_ms()
+                continue
+
+            if self._should_fetch_photo and not self._fetching_photo:
+                self._should_fetch_photo = False
+                await self._fetch_photo(render_update)
                 last_time = time.ticks_ms()
                 continue
 
@@ -534,6 +560,107 @@ class DuckFactsApp(app.App):
             self._fetching_mastodon = False
             eventbus.emit(PatternEnable())
 
+    async def _fetch_photo(self, render_update):
+        self._fetching_photo = True
+        eventbus.emit(PatternDisable())
+        await render_update()
+        try:
+            headers = {
+                "User-Agent": "tildagon-duck-facts"
+            }
+            resp = await async_helpers.unblock(
+                requests.get,
+                render_update,
+                "https://ducks.now/api/v0/random/",
+                headers=headers
+            )
+            data = None
+            try:
+                if resp.status_code == 200:
+                    data = resp.json()
+            finally:
+                resp.close()
+
+            if data and data.get("download_url"):
+                download_url = data.get("download_url")
+                proxy_url = f"https://wsrv.nl/?url={download_url}&w=150&h=150&output=jpg&q=80"
+                img_resp = await async_helpers.unblock(
+                    requests.get,
+                    render_update,
+                    proxy_url,
+                    headers=headers
+                )
+                try:
+                    if img_resp.status_code == 200:
+                        content = img_resp.content
+                        if content and len(content) > 0:
+                            t = time.ticks_ms()
+                            new_path = f"{_ASSET_PATH}duck_photo_{t}.jpg"
+                            with open(new_path, "wb") as f:
+                                f.write(content)
+
+                            old_path = self._photo_path
+                            default_path = _ASSET_PATH + "duck_photo.jpg"
+                            if old_path != default_path:
+                                try:
+                                    os.remove(old_path)
+                                except Exception:
+                                    pass
+
+                            self._photo_path = new_path
+                            settings.set("duckfacts_photo_path", new_path)
+
+                            if sys.implementation.name != "micropython":
+                                try:
+                                    import sys as _sys
+                                    for mod_name, mod in _sys.modules.items():
+                                        if mod_name == "ctx" or mod_name.endswith(".ctx"):
+                                            if hasattr(mod, "_img_cache") and old_path in mod._img_cache:
+                                                del mod._img_cache[old_path]
+                                            if hasattr(mod, "_img_cache") and new_path in mod._img_cache:
+                                                del mod._img_cache[new_path]
+                                except Exception:
+                                    pass
+
+                            self._photo_title = data.get("title", "Duck")
+                            self._photo_description = data.get("description", "No description")
+                            self._photo_attribution = data.get("attribution_name", "Unknown")
+                            lic = data.get("attribution_license", "Unknown")
+                            if "Creative Commons" in lic:
+                                lic = lic.replace("Creative Commons", "CC")
+                                lic = lic.replace("Attribution-Share Alike", "BY-SA")
+                                lic = lic.replace("Attribution", "BY")
+                                lic = lic.replace("International", "")
+                                lic = lic.replace("License", "")
+                                lic = lic.strip()
+                            elif lic == "Public domain":
+                                lic = "PD"
+                            self._photo_license = lic
+
+                            settings.set("duckfacts_photo_title", self._photo_title)
+                            settings.set("duckfacts_photo_description", self._photo_description)
+                            settings.set("duckfacts_photo_attribution", self._photo_attribution)
+                            settings.set("duckfacts_photo_license", self._photo_license)
+                            settings.save()
+
+                            self._photo_wrapped_title = None
+                            self._photo_wrapped_attrib = None
+                            self._photo_wrapped_desc = None
+                            self._photo_sub = "image"
+                            self._fact_count = _increment_fact_count()
+                finally:
+                    img_resp.close()
+        except Exception as e:
+            print("Photo fetch error:", e)
+        finally:
+            self._fetching_photo = False
+            # Double flash in gentle yellow when done
+            led_colour = (120, 90, 0)
+            self._set_leds(led_colour)
+            self._flash_colour = led_colour
+            self._flash_steps = 4
+            self._flash_timer = _FLASH_PERIOD
+
     # -----------------------------------------------------------------------
     # Favourites
     # -----------------------------------------------------------------------
@@ -559,7 +686,7 @@ class DuckFactsApp(app.App):
         tildagonos.leds.write()
 
     def background_update(self, delta):
-        if self._fetching or self._fetching_mastodon:
+        if self._fetching or self._fetching_mastodon or self._fetching_photo:
             self._anim_phase = (
                 self._anim_phase + delta * _NUM_LEDS / _SWEEP_PERIOD
             ) % _NUM_LEDS
@@ -603,6 +730,7 @@ class DuckFactsApp(app.App):
     # -----------------------------------------------------------------------
 
     def update(self, delta):
+        bg.update(delta)
         if self.notification:
             self.notification.update(delta)
             if not self.notification._open and self.notification._is_closed():
@@ -613,6 +741,10 @@ class DuckFactsApp(app.App):
             self.button_states.clear()
             self._confirm_hold_ms = 0
             self._confirm_was_held = False
+            self._left_hold_ms = 0
+            self._left_was_held = False
+            self._up_hold_ms = 0
+            self._up_was_held = False
             if self._view == _HOME:
                 self.minimise()
             else:
@@ -670,32 +802,58 @@ class DuckFactsApp(app.App):
                 self._view = _LEDS
             elif self.button_states.get(BUTTON_TYPES["CONFIRM"]):
                 self.button_states.clear()
+                self._photo_path = _ASSET_PATH + "duck_photo.jpg"
+                self._photo_title = "Duck"
+                self._photo_description = "It's a duck"
+                self._photo_attribution = "starwatchers-studio"
+                self._photo_license = "itch.io"
+                self._photo_wrapped_title = None
+                self._photo_wrapped_attrib = None
+                self._photo_wrapped_desc = None
+                self._photo_sub = "image"
                 self._view = _PHOTO
 
+            # UP (top button): short press = credits, long press = prompt clear quack count
+            up_now = self.button_states.get(BUTTON_TYPES["UP"])
+            if up_now:
+                self._up_hold_ms += delta
+                self._up_was_held = True
+            elif self._up_was_held:
+                self._up_was_held = False
+                hold = self._up_hold_ms
+                self._up_hold_ms = 0
+                self.button_states.clear()
+                if hold >= _LONG_PRESS_MS:
+                    self._view = _PROMPT_CLEAR
+                else:
+                    self._credits_page = 0
+                    self._view = _CREDITS
+            else:
+                self._up_hold_ms = 0
+
         elif self._view == _FACT:
-            # CONFIRM: short press = another fact, long press = save favourite
-            confirm_now = self.button_states.get(BUTTON_TYPES["CONFIRM"])
-            if confirm_now:
-                self._confirm_hold_ms += delta
-                self._confirm_was_held = True
-            elif self._confirm_was_held:
-                self._confirm_was_held = False
-                hold = self._confirm_hold_ms
-                self._confirm_hold_ms = 0
+            if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+                self.button_states.clear()
+                self._fetch_mode = "live"
+                self._should_fetch = True
+
+            left_now = self.button_states.get(BUTTON_TYPES["LEFT"])
+            if left_now:
+                self._left_hold_ms += delta
+                self._left_was_held = True
+            elif self._left_was_held:
+                self._left_was_held = False
+                hold = self._left_hold_ms
+                self._left_hold_ms = 0
                 self.button_states.clear()
                 if hold >= _LONG_PRESS_MS:
                     self._save_favourite()
                 else:
-                    self._fetch_mode = "live"
-                    self._should_fetch = True
+                    self._fav_index = 0
+                    self._fav_wrapped = None
+                    self._view = _FAVS
             else:
-                self._confirm_hold_ms = 0
-
-            if self.button_states.get(BUTTON_TYPES["LEFT"]):
-                self.button_states.clear()
-                self._fav_index = 0
-                self._fav_wrapped = None
-                self._view = _FAVS
+                self._left_hold_ms = 0
 
         elif self._view == _MASTODON:
             idx = _MASTO_PAGES.index(self._mastodon_sub)
@@ -723,12 +881,52 @@ class DuckFactsApp(app.App):
                     self._fav_index = min(len(self._fav_facts) - 1, self._fav_index + 1)
                     self._fav_wrapped = None
 
+        elif self._view == _PHOTO:
+            idx = _PHOTO_PAGES.index(self._photo_sub)
+            if self.button_states.get(BUTTON_TYPES["UP"]) and idx > 0:
+                self.button_states.clear()
+                self._photo_sub = _PHOTO_PAGES[idx - 1]
+            elif self.button_states.get(BUTTON_TYPES["DOWN"]) and idx < len(_PHOTO_PAGES) - 1:
+                self.button_states.clear()
+                self._photo_sub = _PHOTO_PAGES[idx + 1]
+            elif self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+                self.button_states.clear()
+                if not self._fetching_photo:
+                    self._should_fetch_photo = True
+
+        elif self._view == _CREDITS:
+            if self.button_states.get(BUTTON_TYPES["UP"]):
+                self.button_states.clear()
+                self._credits_page = max(0, self._credits_page - 1)
+            elif self.button_states.get(BUTTON_TYPES["DOWN"]):
+                self.button_states.clear()
+                self._credits_page = min(2, self._credits_page + 1)
+
+        elif self._view == _PROMPT_CLEAR:
+            confirm = self.button_states.get(BUTTON_TYPES["CONFIRM"])
+            any_pressed = False
+            for btn_name in BUTTON_TYPES:
+                if self.button_states.get(BUTTON_TYPES[btn_name]):
+                    any_pressed = True
+                    break
+            if any_pressed:
+                self.button_states.clear()
+                if confirm:
+                    self._fact_count = 0
+                    settings.set("duckfacts_count", 0)
+                    settings.save()
+                    self.notification = Notification("Cleared!")
+                self._view = _HOME
+
     # -----------------------------------------------------------------------
     # Drawing
     # -----------------------------------------------------------------------
 
     def draw(self, ctx):
-        clear_background(ctx)
+        if self._view == _LEDS:
+            ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+        else:
+            bg.draw(ctx)
         if self._view == _HOME:
             self._draw_home(ctx)
         elif self._view == _FACT:
@@ -739,6 +937,12 @@ class DuckFactsApp(app.App):
             self._draw_favs(ctx)
         elif self._view == _LEDS:
             self._draw_leds(ctx)
+        elif self._view == _PHOTO:
+            self._draw_photo(ctx)
+        elif self._view == _CREDITS:
+            self._draw_credits(ctx)
+        elif self._view == _PROMPT_CLEAR:
+            self._draw_prompt_clear(ctx)
         else:
             self._draw_stub(ctx)
         if self.notification:
@@ -811,10 +1015,18 @@ class DuckFactsApp(app.App):
             ctx.restore()
 
         if not busy:
+            if self._up_hold_ms > 200:
+                frac = min(self._up_hold_ms / _LONG_PRESS_MS, 1.0)
+                ctx.save()
+                ctx.rgb(0, frac * 0.5, frac * 0.8)
+                ctx.arc(0, -100, 12, 0, 2 * math.pi, True).fill()
+                ctx.restore()
+
             button_labels(ctx)
             self._draw_back_arrow(ctx)
+            self._draw_button_icon(ctx, self._icon_info, 0, -100, align="center")
             self._draw_button_icon(ctx, self._icon_bolt, 75, -75, align="right")
-            self._draw_button_icon(ctx, self._icon_picture, 75, 75, align="right")
+            self._draw_button_icon(ctx, self._icon_binoculars, 75, 75, align="right")
             self._draw_button_icon(ctx, self._icon_confetti, 0, 100, align="center")
             if self._mastodon_sprite:
                 mh = self._mastodon_sprite["h"]
@@ -831,12 +1043,12 @@ class DuckFactsApp(app.App):
                 ctx.restore()
 
     def _draw_fact(self, ctx):
-        # Long-press glow behind repeat icon
-        if self._confirm_hold_ms > 200:
-            frac = min(self._confirm_hold_ms / _LONG_PRESS_MS, 1.0)
+        # Long-press glow behind heart icon (LEFT position)
+        if self._left_hold_ms > 200:
+            frac = min(self._left_hold_ms / _LONG_PRESS_MS, 1.0)
             ctx.save()
-            ctx.rgb(frac * 0.6, frac * 0.4, 0)
-            ctx.arc(75, 75, 12, 0, 2 * math.pi, True).fill()
+            ctx.rgb(frac * 0.8, frac * 0.1, frac * 0.2)
+            ctx.arc(-65, 75, 12, 0, 2 * math.pi, True).fill()
             ctx.restore()
 
         ctx.save()
@@ -1055,6 +1267,134 @@ class DuckFactsApp(app.App):
             ctx.move_to(0, -20).text("DUCK PARTY")
             ctx.rgb(sr, sg, sb)
             ctx.move_to(0, 20).text(subtitle)
+
+        ctx.restore()
+
+    def _draw_photo(self, ctx):
+        ctx.save()
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        ctx.rgb(1, 1, 1)
+
+        if self._fetching_photo:
+            ctx.font_size = small_font_size
+            ctx.move_to(0, 0).text("Looking for ducks...")
+            ctx.restore()
+            button_labels(ctx)
+            self._draw_back_arrow(ctx)
+            return
+
+        if self._photo_sub == "image":
+            r_clip = 70
+            img_y = 0
+            try:
+                ctx.save()
+                ctx.begin_path()
+                ctx.move_to(r_clip, img_y)
+                ctx.arc(0, img_y, r_clip, 0, 2 * math.pi, False)
+                ctx.clip()
+                ctx.image(
+                    self._photo_path,
+                    -r_clip,
+                    img_y - r_clip,
+                    r_clip * 2,
+                    r_clip * 2,
+                )
+                ctx.restore()
+            except Exception:
+                ctx.rgb(0.3, 0.3, 0.3)
+                ctx.begin_path()
+                ctx.arc(0, img_y, r_clip, 0, 2 * math.pi, False)
+                ctx.fill()
+                ctx.rgb(1, 1, 1)
+                ctx.font_size = small_font_size
+                ctx.move_to(0, img_y).text("No image")
+
+            self._draw_down_arrow(ctx)
+
+        elif self._photo_sub == "info":
+            if self._photo_wrapped_title is None:
+                title = self._photo_title or "Rubber Duck"
+                self._photo_title_font, self._photo_wrapped_title = _auto_wrap(
+                    ctx, title, max_height=35, width=170
+                )
+            ctx.rgb(0.4, 0.6, 0.9)
+            self._draw_wrapped_lines(ctx, self._photo_wrapped_title, self._photo_title_font, y_offset=-80)
+
+            if self._photo_wrapped_desc is None:
+                desc = self._photo_description or "A duck photo"
+                self._photo_desc_font, self._photo_wrapped_desc = _auto_wrap(
+                    ctx, desc, max_height=55, width=170
+                )
+            ctx.rgb(1, 1, 1)
+            self._draw_wrapped_lines(ctx, self._photo_wrapped_desc, self._photo_desc_font, y_offset=-20)
+
+            if self._photo_wrapped_attrib is None:
+                attrib = f"by {self._photo_attribution}" if self._photo_attribution else "by Unknown"
+                self._photo_attrib_font, self._photo_wrapped_attrib = _auto_wrap(
+                    ctx, attrib, max_height=30, width=170
+                )
+            ctx.rgb(0.7, 0.7, 0.7)
+            self._draw_wrapped_lines(ctx, self._photo_wrapped_attrib, self._photo_attrib_font, y_offset=35)
+
+            if self._photo_license:
+                ctx.font_size = small_font_size - 2
+                ctx.rgb(0.5, 0.5, 0.5)
+                ctx.move_to(0, 75).text(self._photo_license)
+
+            self._draw_up_arrow(ctx)
+
+        ctx.restore()
+        button_labels(ctx)
+        self._draw_back_arrow(ctx)
+        self._draw_button_icon(ctx, self._icon_binoculars, 75, 75, align="right")
+
+    def _draw_credits(self, ctx):
+        ctx.save()
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+
+        ctx.rgb(0.4, 0.6, 0.9)
+        ctx.font_size = label_font_size
+        ctx.move_to(0, -75).text("Thanks!")
+
+        ctx.rgb(1, 1, 1)
+        ctx.font_size = small_font_size
+
+        if self._credits_page == 0:
+            ctx.move_to(0, -30).text("caz-bee (sprites)")
+            ctx.move_to(0, 10).text("starwatchers-studio")
+            ctx.move_to(0, 50).text("ducks.now (photos)")
+        elif self._credits_page == 1:
+            ctx.move_to(0, -30).text("wsrv.nl (image proxy)")
+            ctx.move_to(0, 10).text("Flaticon (icons)")
+            ctx.move_to(0, 50).text("@emfducks")
+        else:
+            ctx.move_to(0, -30).text("Anon duck facts API")
+            ctx.move_to(0, 10).text("bjorn-knudsen (more facts)")
+
+        ctx.restore()
+
+        if self._credits_page > 0:
+            self._draw_up_arrow(ctx)
+        if self._credits_page < 2:
+            self._draw_down_arrow(ctx)
+
+        self._draw_back_arrow(ctx)
+
+    def _draw_prompt_clear(self, ctx):
+        ctx.save()
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+
+        ctx.rgb(1, 1, 1)
+        ctx.font_size = label_font_size
+        ctx.move_to(0, -30).text("Clear quacks?")
+
+        ctx.font_size = small_font_size
+        ctx.rgb(0.7, 0.7, 0.7)
+        ctx.move_to(0, 15).text("C to confirm")
+        ctx.move_to(0, 45).text("Any other to cancel")
 
         ctx.restore()
 
