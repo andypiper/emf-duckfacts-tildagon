@@ -1,41 +1,427 @@
 import asyncio
+import gzip
+import json
+import math
+import os
+import random
+import sys
 import time
 
 import app
 import async_helpers
 import requests
+import settings
 
 from app_components import Notification, clear_background
-from app_components.tokens import label_font_size, small_font_size
+from app_components.tokens import button_labels, label_font_size, small_font_size
 from app_components.utils import wrap_text
 from events.input import Buttons, BUTTON_TYPES
 from system.eventbus import eventbus
 from system.patterndisplay.events import PatternDisable, PatternEnable
 from tildagonos import tildagonos
 
+try:
+    import imu as _imu
+
+    _HAS_IMU = True
+except ImportError:
+    _HAS_IMU = False
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 _FACT_URL = "https://03vpefsitf.execute-api.eu-west-1.amazonaws.com/prod/"
-_FACT_WIDTH = 180
-_LED_YELLOW = (80, 60, 0)
+_MASTODON_LOOKUP = "https://mastodon.social/api/v1/accounts/lookup?acct=emfducks"
+_MASTODON_STATUSES = (
+    "https://mastodon.social/api/v1/accounts/{}/statuses"
+    "?limit=1&exclude_reblogs=true&exclude_replies=true"
+)
+
+_FACT_WIDTH = 160
+_FACT_MAX_HEIGHT = 175
+_FACT_MIN_FONT = 12
+_LONG_PRESS_MS = 1500
+
 _NUM_LEDS = 12
-_SWEEP_PERIOD = 2000  # ms for one full sweep around the badge while fetching
-_FLASH_PERIOD = 400  # ms per on/off phase of the post-fetch double flash
+_SWEEP_PERIOD = 2000
+_SWEEP_COLOUR = (120, 90, 0)
+_FLASH_PERIOD = 400
+_ANIM_MS = 150
+_SPRITE_SCALE = 3
+_AVATAR_RADIUS = 50
+
+# LED rotation palettes for the lights view, matched to duck colour scheme
+_LED_MALLARD_COLOURS = (  # duck 1: green → brown → orange
+    (0, 90, 0),
+    (0, 90, 0),
+    (0, 80, 0),
+    (0, 80, 0),
+    (90, 55, 0),
+    (90, 55, 0),
+    (80, 50, 0),
+    (80, 50, 0),
+    (190, 70, 0),
+    (190, 70, 0),
+    (170, 65, 0),
+    (170, 65, 0),
+)
+_LED_YELLOW_COLOURS = (  # duck 2 & 3: bright yellow → gold → amber
+    (200, 160, 0),
+    (200, 160, 0),
+    (200, 160, 0),
+    (200, 160, 0),
+    (160, 110, 0),
+    (160, 110, 0),
+    (160, 110, 0),
+    (160, 110, 0),
+    (180, 90, 0),
+    (180, 90, 0),
+    (180, 90, 0),
+    (180, 90, 0),
+)
+_LED_DUCK_PERIOD = 2000
+_LED_PARTY_PERIOD = 1400  # faster rotation on the DUCK PARTY screen
+
+# Map sprite filename prefix → LED palette
+_DUCK_LED_MAP = {
+    "duck_": _LED_MALLARD_COLOURS,
+    "duck2_": _LED_YELLOW_COLOURS,
+    "duck3_": _LED_YELLOW_COLOURS,
+}
+
+_NON_QUACK = ["*honk*", "*hiss*", "*whistle*", "*squeak*", "*coo*"]
+
+# Party mode themes for the DUCK PARTY lights screen.
+# Switch via: settings.set("duckfacts_party", "2024") / settings.save()
+# Default is "2026". "2024" is an easter egg (SOLAR POWER DUCK PARTY).
+_PARTY_2026 = "2026"
+_PARTY_2024 = "2024"  # easter egg
+
+# 2026 star colours: #F77F02 orange, #F9E200 yellow, white
+# LED rotation always follows the loaded duck's colour scheme (self._duck_leds).
+_PARTY_MODES = {
+    _PARTY_2026: {
+        "subtitle": "IN SPAAACE!",
+        "title_rgb": (0.9, 0.7, 0.1),
+        "subtitle_rgb": (0.5, 0.8, 1.0),
+        "star_colours": ((247, 127, 2), (249, 226, 0), (255, 255, 255)),
+    },
+    _PARTY_2024: {
+        "subtitle": "SOLAR POWER!",
+        "title_rgb": (1.0, 0.9, 0.1),
+        "subtitle_rgb": (1.0, 0.5, 0.0),
+        "star_colours": ((255, 200, 0), (255, 140, 0), (255, 245, 200)),
+    },
+}
+
+# Views
+_HOME = "home"
+_FACT = "fact"
+_MASTODON = "mastodon"
+_PHOTO = "photo"
+_LEDS = "leds"
+_FAVS = "favs"
+
+# Mastodon sub-pages ordered top to bottom (UP/DOWN navigate)
+_MASTO_PAGES = ["qr", "avatar", "content", "time"]
+
+# Exclusion zones for DUCK PARTY stars: (x_min, x_max, y_min, y_max)
+# Based on sprite scale=3, fh≈25, oy≈-47; label_font_size≈26px.
+# Subtitle zone covers both "IN SPAAACE!" and "SOLAR POWER!" (similar widths).
+_STAR_EXCLUSIONS = (
+    (-42, 42, -50, 30),  # duck sprite body
+    (-77, 77, -82, -53),  # "DUCK PARTY" title
+    (-82, 82, 35, 62),  # subtitle (IN SPAAACE! / SOLAR POWER!)
+)
+
+
+def _star_ok(x, y):
+    for x0, x1, y0, y1 in _STAR_EXCLUSIONS:
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return False
+    return True
+
+
+_STUB_LABELS = {
+    _PHOTO: "Duck photo",
+}
+
+# ---------------------------------------------------------------------------
+# Asset path resolution
+# ---------------------------------------------------------------------------
+
+if sys.implementation.name == "micropython":
+    _ASSET_PATH = "assets/"
+    try:
+        for _a in os.listdir("/apps"):
+            if _a.startswith("andypiper_emf"):
+                _ASSET_PATH = f"/apps/{_a}/assets/"
+                break
+    except OSError:
+        pass
+else:
+    _ASSET_PATH = os.path.dirname(os.path.abspath(__file__)) + "/assets/"
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _feistiness_colour(rating):
+    if rating < 34:
+        return (60, 40, 0)
+    elif rating < 67:
+        return (120, 90, 0)
+    else:
+        return (200, 70, 0)
+
+
+def _load_sprite(filename):
+    try:
+        with open(_ASSET_PATH + filename, "rb") as f:
+            return json.loads(gzip.decompress(f.read()).decode())
+    except OSError:
+        return None
+
+
+def _load_local_facts():
+    try:
+        with open(_ASSET_PATH + "facts.txt.gz", "rb") as f:
+            text = gzip.decompress(f.read()).decode()
+        return [ln for ln in text.splitlines() if ln.strip()]
+    except OSError:
+        return []
+
+
+def _load_favs():
+    try:
+        return json.loads(settings.get("duckfacts_favs", "[]"))
+    except Exception:
+        return []
+
+
+def _save_favs(favs):
+    settings.set("duckfacts_favs", json.dumps(favs))
+    settings.save()
+
+
+def _increment_fact_count():
+    n = settings.get("duckfacts_count", 0) + 1
+    settings.set("duckfacts_count", n)
+    settings.save()
+    return n
+
+
+def _strip_html(text):
+    for tag in ("<br>", "<br/>", "<br />", "</p>", "</li>"):
+        text = text.replace(tag, "\n")
+    result = []
+    in_tag = False
+    for ch in text:
+        if ch == "<":
+            in_tag = True
+        elif ch == ">":
+            in_tag = False
+        elif not in_tag:
+            result.append(ch)
+    out = "".join(result)
+    for entity, char in (
+        ("&amp;", "&"),
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", '"'),
+        ("&#39;", "'"),
+        ("&apos;", "'"),
+    ):
+        out = out.replace(entity, char)
+    while "\n\n\n" in out:
+        out = out.replace("\n\n\n", "\n\n")
+    return out.strip()
+
+
+def _break_long_words(text, max_chars=14):
+    """Replace URLs with [link] and split words > max_chars.
+
+    fill_line() in app_components/utils.py has an infinite-loop bug when a
+    word is wider than the line width: the inner while loop shrinks 'word' to
+    '' but never updates 'remaining_word', spinning forever.  Pre-breaking long
+    words prevents that path from being reached.
+    """
+    result = []
+    for paragraph in text.split("\n"):
+        words = []
+        for word in paragraph.split(" "):
+            if word.startswith("http://") or word.startswith("https://"):
+                words.append("[link]")
+            elif len(word) > max_chars:
+                while len(word) > max_chars:
+                    words.append(word[:max_chars])
+                    word = word[max_chars:]
+                if word:
+                    words.append(word)
+            else:
+                words.append(word)
+        result.append(" ".join(words))
+    return "\n".join(result)
+
+
+def _auto_wrap(ctx, text, max_height, width=_FACT_WIDTH):
+    """Wrap text, stepping font down until block fits or hits minimum."""
+    text = _break_long_words(text)
+    font_size = small_font_size
+    while font_size >= _FACT_MIN_FONT:
+        ctx.font_size = font_size
+        lines = wrap_text(ctx, text, font_size, width=width)
+        if len(lines) * font_size <= max_height:
+            return font_size, lines
+        font_size -= 2
+    return font_size, lines
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
 
 class DuckFactsApp(app.App):
     def __init__(self):
         super().__init__()
-        self.fact = "Ready for a Duck Fact?\nPress confirm!"
+        self._view = _HOME
+
+        # Fact display
+        self.fact = None
         self.notification = None
         self.button_states = Buttons(self)
         self._wrapped_lines = None
-        self._font_size = label_font_size  # larger for the initial prompt
+        self._font_size = small_font_size
+        self._fetch_mode = "live"
+        self._local_facts = _load_local_facts()
 
+        # Fetch state
         self._fetching = False
         self._should_fetch = False
+        self._fetching_mastodon = False
+        self._should_fetch_mastodon = False
+
+        # Long-press for favourites
+        self._confirm_hold_ms = 0
+        self._confirm_was_held = False
+
+        # Shake-to-fact (local facts)
+        self._shake_cooldown = 0
+        self._last_magnitude = (
+            9.8  # approximate resting gravity; overwritten on first read
+        )
+        if _HAS_IMU:
+            try:
+                _acc = _imu.acc_read()
+                self._last_magnitude = math.sqrt(
+                    _acc[0] ** 2 + _acc[1] ** 2 + _acc[2] ** 2
+                )
+            except Exception:
+                pass
+
+        # LED animation
         self._anim_phase = 0.0
-        # post-fetch double flash state machine: 4 = start ON, counts to 0
         self._flash_steps = 0
         self._flash_timer = 0
+        self._flash_colour = _SWEEP_COLOUR
+
+        # Duck sprite — load one random animation; only one kept in heap at a time
+        _names = [
+            "duck_idle_normal.json.gz",
+            "duck_walk_normal.json.gz",
+            "duck_idle_bounce.json.gz",
+            "duck_walk_bounce.json.gz",
+            "duck2_idle_normal.json.gz",
+            "duck2_walk_normal.json.gz",
+            "duck2_idle_bounce.json.gz",
+            "duck2_walk_bounce.json.gz",
+            "duck3_idle_normal.json.gz",
+            "duck3_walk_normal.json.gz",
+        ]
+        _start = random.randint(0, len(_names) - 1)
+        self._sprite = None
+        _chosen = "duck_"
+        for _i in range(len(_names)):
+            _n = _names[(_start + _i) % len(_names)]
+            _s = _load_sprite(_n)
+            if _s is not None:
+                self._sprite = _s
+                _chosen = _n
+                break
+        # LED palette for the lights view matches the loaded duck's colours
+        self._duck_leds = _LED_MALLARD_COLOURS
+        for _prefix, _pal in _DUCK_LED_MAP.items():
+            if _chosen.startswith(_prefix):
+                self._duck_leds = _pal
+                break
+        self._anim_frame = 0
+        self._anim_timer = _ANIM_MS
+
+        # Party mode — readable via REPL: settings.set("duckfacts_party","2024")
+        self._party = _PARTY_MODES.get(
+            settings.get("duckfacts_party", _PARTY_2026),
+            _PARTY_MODES[_PARTY_2026],
+        )
+
+        # Stars for the DUCK PARTY screen: [x, y, phase, speed_per_frame, colour_idx]
+        # Rejection-sample to keep stars out of the duck and text areas.
+        _nc = len(self._party["star_colours"])
+        self._stars = []
+        for _ in range(500):
+            if len(self._stars) >= 25:
+                break
+            _sx = random.randint(-110, 110)
+            _sy = random.randint(-110, 110)
+            if _star_ok(_sx, _sy):
+                self._stars.append(
+                    [
+                        _sx,
+                        _sy,
+                        random.random() * 6.28,
+                        0.03 + random.random() * 0.12,
+                        random.randint(0, _nc - 1),
+                    ]
+                )
+
+        # Mastodon view
+        self._mastodon_post = None
+        self._mastodon_time = None
+        self._mastodon_sub = "content"
+        self._mastodon_wrapped = None
+        self._masto_font = small_font_size
+        cached = settings.get("mastodon_emfducks_post", None)
+        if cached:
+            try:
+                post = json.loads(cached)
+                self._mastodon_post = post.get("content")
+                self._mastodon_time = post.get("time")
+            except Exception:
+                pass
+
+        # Sprites for UI
+        self._mastodon_sprite = _load_sprite("mastodon.json.gz")
+        self._qr_sprite = _load_sprite("emfducks_qr.json.gz")
+        self._icon_bolt = _load_sprite("icon_bolt.json.gz")
+        self._icon_confetti = _load_sprite("icon_confetti.json.gz")
+        self._icon_picture = _load_sprite("icon_picture.json.gz")
+        self._icon_heart = _load_sprite("icon_heart.json.gz")
+        self._icon_refresh = _load_sprite("icon_refresh.json.gz")
+
+        # Favourites
+        self._fav_facts = _load_favs()
+        self._fav_index = 0
+        self._fav_wrapped = None
+        self._fav_font = small_font_size
+
+        # Cached display values
+        self._fact_count = settings.get("duckfacts_count", 0)
+
+    # -----------------------------------------------------------------------
+    # Async loop
+    # -----------------------------------------------------------------------
 
     async def run(self, render_update):
         last_time = time.ticks_ms()
@@ -47,7 +433,13 @@ class DuckFactsApp(app.App):
             if self._should_fetch and not self._fetching:
                 self._should_fetch = False
                 await self._fetch_fact(render_update)
-                last_time = time.ticks_ms()  # reset after blocking fetch
+                last_time = time.ticks_ms()
+                continue
+
+            if self._should_fetch_mastodon and not self._fetching_mastodon:
+                self._should_fetch_mastodon = False
+                await self._fetch_mastodon(render_update)
+                last_time = time.ticks_ms()
                 continue
 
             if self.update(delta) is not False:
@@ -59,22 +451,107 @@ class DuckFactsApp(app.App):
         self._fetching = True
         self._anim_phase = 0.0
         eventbus.emit(PatternDisable())
+        led_colour = _feistiness_colour(50)
+        sound = "QUACK!"
         try:
-            response = await async_helpers.unblock(
-                requests.get, render_update, _FACT_URL
-            )
-            self.fact = response.json()["fact"]
+            if self._fetch_mode == "local" and self._local_facts:
+                self.fact = random.choice(self._local_facts)
+                await asyncio.sleep(0.05)
+            else:
+                response = await async_helpers.unblock(
+                    requests.get, render_update, _FACT_URL
+                )
+                try:
+                    data = response.json()
+                    self.fact = data["fact"]
+                    led_colour = _feistiness_colour(
+                        data.get("feistynessRating", 50))
+                    if not data.get("quack", True):
+                        sound = random.choice(_NON_QUACK)
+                finally:
+                    response.close()
         except Exception:
             self.fact = "No ducks available!\nCheck your wifi."
         finally:
+            self._fact_count = _increment_fact_count()
             self._fetching = False
             self._wrapped_lines = None
             self._font_size = small_font_size
-            self.notification = Notification("QUACK!")
-            # Start double flash: set LEDs ON and kick off state machine
-            self._set_leds(_LED_YELLOW)
+            self._view = _FACT
+            self.notification = Notification(sound)
+            self._set_leds(led_colour)
+            self._flash_colour = led_colour
             self._flash_steps = 4
             self._flash_timer = _FLASH_PERIOD
+
+    async def _fetch_mastodon(self, render_update):
+        self._fetching_mastodon = True
+        eventbus.emit(PatternDisable())
+        try:
+            account_id = settings.get("mastodon_emfducks_id", None)
+            if not account_id:
+                r = await async_helpers.unblock(
+                    requests.get, render_update, _MASTODON_LOOKUP
+                )
+                try:
+                     account_id = r.json()["id"]
+                finally:
+                     r.close()
+                settings.set("mastodon_emfducks_id", account_id)
+                settings.save()
+
+            r = await async_helpers.unblock(
+                requests.get,
+                render_update,
+                _MASTODON_STATUSES.format(account_id),
+            )
+            try:
+                data = r.json()
+                r.close()
+                if data:
+                    latest = data[0]
+                    content = _strip_html(latest.get("content", ""))
+                    raw_ts = latest.get("created_at", "")
+                    time_str = (
+                        raw_ts[:16].replace("T", " ") if len(raw_ts) >= 16 else raw_ts[:10]
+                    )
+                    self._mastodon_post = content
+                    self._mastodon_time = time_str
+                    self._mastodon_wrapped = None
+                    settings.set(
+                        "mastodon_emfducks_post",
+                        json.dumps({"content": content, "time": time_str}),
+                    )
+                    settings.save()
+            finally:
+                r.close()
+        except Exception as e:
+            print("Mastodon fetch error:", e)
+            if self._mastodon_post is None:
+                self._mastodon_post = "Could not fetch @emfducks.\nCheck your wifi."
+                self._mastodon_time = ""
+        finally:
+            self._fetching_mastodon = False
+            eventbus.emit(PatternEnable())
+
+    # -----------------------------------------------------------------------
+    # Favourites
+    # -----------------------------------------------------------------------
+
+    def _save_favourite(self):
+        if not self.fact:
+            return
+        if self.fact not in self._fav_facts:
+            self._fav_facts.append(self.fact)
+            _save_favs(self._fav_facts)
+            msg = "Saved!"
+        else:
+            msg = "Already saved"
+        self.notification = Notification(msg)
+
+    # -----------------------------------------------------------------------
+    # LEDs
+    # -----------------------------------------------------------------------
 
     def _set_leds(self, colour):
         for i in range(1, _NUM_LEDS + 1):
@@ -82,8 +559,7 @@ class DuckFactsApp(app.App):
         tildagonos.leds.write()
 
     def background_update(self, delta):
-        if self._fetching:
-            # Sweep: one LED front moves smoothly around the ring
+        if self._fetching or self._fetching_mastodon:
             self._anim_phase = (
                 self._anim_phase + delta * _NUM_LEDS / _SWEEP_PERIOD
             ) % _NUM_LEDS
@@ -91,19 +567,17 @@ class DuckFactsApp(app.App):
             frac = self._anim_phase - lit
             for i in range(_NUM_LEDS):
                 if i < lit:
-                    tildagonos.leds[i + 1] = _LED_YELLOW
+                    tildagonos.leds[i + 1] = _SWEEP_COLOUR
                 elif i == lit:
-                    # fractional leading edge fades in
                     tildagonos.leds[i + 1] = (
-                        int(_LED_YELLOW[0] * frac),
-                        int(_LED_YELLOW[1] * frac),
+                        int(_SWEEP_COLOUR[0] * frac),
+                        int(_SWEEP_COLOUR[1] * frac),
                         0,
                     )
                 else:
                     tildagonos.leds[i + 1] = (0, 0, 0)
             tildagonos.leds.write()
         elif self._flash_steps > 0:
-            # Double flash: ON→OFF→ON→OFF, each phase _FLASH_PERIOD ms
             self._flash_timer -= delta
             if self._flash_timer <= 0:
                 self._flash_steps -= 1
@@ -112,52 +586,492 @@ class DuckFactsApp(app.App):
                     self._set_leds((0, 0, 0))
                     eventbus.emit(PatternEnable())
                 elif self._flash_steps % 2 == 0:
-                    self._set_leds(_LED_YELLOW)
+                    self._set_leds(self._flash_colour)
                 else:
                     self._set_leds((0, 0, 0))
+        elif self._view == _LEDS:
+            self._anim_phase = (
+                self._anim_phase + delta * _NUM_LEDS / _LED_PARTY_PERIOD
+            ) % _NUM_LEDS
+            offset = int(self._anim_phase)
+            for i in range(_NUM_LEDS):
+                tildagonos.leds[i + 1] = self._duck_leds[(i + offset) % _NUM_LEDS]
+            tildagonos.leds.write()
 
-    def select_handler(self):
-        self.button_states.clear()
-        self._should_fetch = True
-
-    def back_handler(self):
-        self.button_states.clear()
-        self.minimise()
+    # -----------------------------------------------------------------------
+    # Input
+    # -----------------------------------------------------------------------
 
     def update(self, delta):
         if self.notification:
             self.notification.update(delta)
             if not self.notification._open and self.notification._is_closed():
                 self.notification = None
+
+        # CANCEL always: exit from home, return to home from content views
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
-            self.back_handler()
-        if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
-            self.select_handler()
+            self.button_states.clear()
+            self._confirm_hold_ms = 0
+            self._confirm_was_held = False
+            if self._view == _HOME:
+                self.minimise()
+            else:
+                if self._view == _LEDS:
+                    self._set_leds((0, 0, 0))
+                    eventbus.emit(PatternEnable())
+                self._view = _HOME
+                self._wrapped_lines = None
+            return
+
+        if self._view in (_HOME, _LEDS):
+            if self._sprite and not self._fetching:
+                self._anim_timer -= delta
+                if self._anim_timer <= 0:
+                    self._anim_frame = (self._anim_frame + 1) % len(
+                        self._sprite["frames"]
+                    )
+                    self._anim_timer += _ANIM_MS
+
+        if self._view == _HOME:
+            # Shake triggers a random local fact
+            if _HAS_IMU and not self._fetching:
+                self._shake_cooldown = max(0, self._shake_cooldown - delta)
+                try:
+                    acc = _imu.acc_read()
+                    mag = math.sqrt(acc[0] ** 2 + acc[1] ** 2 + acc[2] ** 2)
+                    if (
+                        self._shake_cooldown == 0
+                        and abs(mag - self._last_magnitude) > 5.0
+                    ):
+                        self._fetch_mode = "local"
+                        self._should_fetch = True
+                        self._shake_cooldown = 3000
+                    self._last_magnitude = mag
+                except Exception:
+                    pass
+
+            # Clock-face layout:
+            #   CANCEL(top-L)=exit  UP(top)=free    RIGHT(top-R)=live
+            #   LEFT(bot-L)=@emf    DOWN(bot)=lights CONFIRM(bot-R)=photo
+            if self.button_states.get(BUTTON_TYPES["RIGHT"]):
+                self.button_states.clear()
+                self._fetch_mode = "live"
+                self._should_fetch = True
+            elif self.button_states.get(BUTTON_TYPES["LEFT"]):
+                self.button_states.clear()
+                self._mastodon_sub = "content"
+                self._view = _MASTODON
+                if self._mastodon_post is None and not self._fetching_mastodon:
+                    self._should_fetch_mastodon = True
+            elif self.button_states.get(BUTTON_TYPES["DOWN"]):
+                self.button_states.clear()
+                self._anim_phase = 0.0
+                eventbus.emit(PatternDisable())
+                self._view = _LEDS
+            elif self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+                self.button_states.clear()
+                self._view = _PHOTO
+
+        elif self._view == _FACT:
+            # CONFIRM: short press = another fact, long press = save favourite
+            confirm_now = self.button_states.get(BUTTON_TYPES["CONFIRM"])
+            if confirm_now:
+                self._confirm_hold_ms += delta
+                self._confirm_was_held = True
+            elif self._confirm_was_held:
+                self._confirm_was_held = False
+                hold = self._confirm_hold_ms
+                self._confirm_hold_ms = 0
+                self.button_states.clear()
+                if hold >= _LONG_PRESS_MS:
+                    self._save_favourite()
+                else:
+                    self._fetch_mode = "live"
+                    self._should_fetch = True
+            else:
+                self._confirm_hold_ms = 0
+
+            if self.button_states.get(BUTTON_TYPES["LEFT"]):
+                self.button_states.clear()
+                self._fav_index = 0
+                self._fav_wrapped = None
+                self._view = _FAVS
+
+        elif self._view == _MASTODON:
+            idx = _MASTO_PAGES.index(self._mastodon_sub)
+            if self.button_states.get(BUTTON_TYPES["UP"]):
+                self.button_states.clear()
+                self._mastodon_sub = _MASTO_PAGES[max(0, idx - 1)]
+            elif self.button_states.get(BUTTON_TYPES["DOWN"]):
+                self.button_states.clear()
+                self._mastodon_sub = _MASTO_PAGES[min(len(_MASTO_PAGES) - 1, idx + 1)]
+            elif self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+                self.button_states.clear()
+                self._mastodon_post = None
+                self._mastodon_wrapped = None
+                self._mastodon_sub = "content"
+                self._should_fetch_mastodon = True
+
+        elif self._view == _FAVS:
+            if self._fav_facts:
+                if self.button_states.get(BUTTON_TYPES["UP"]):
+                    self.button_states.clear()
+                    self._fav_index = max(0, self._fav_index - 1)
+                    self._fav_wrapped = None
+                elif self.button_states.get(BUTTON_TYPES["DOWN"]):
+                    self.button_states.clear()
+                    self._fav_index = min(len(self._fav_facts) - 1, self._fav_index + 1)
+                    self._fav_wrapped = None
+
+    # -----------------------------------------------------------------------
+    # Drawing
+    # -----------------------------------------------------------------------
 
     def draw(self, ctx):
         clear_background(ctx)
-        ctx.save()
+        if self._view == _HOME:
+            self._draw_home(ctx)
+        elif self._view == _FACT:
+            self._draw_fact(ctx)
+        elif self._view == _MASTODON:
+            self._draw_mastodon(ctx)
+        elif self._view == _FAVS:
+            self._draw_favs(ctx)
+        elif self._view == _LEDS:
+            self._draw_leds(ctx)
+        else:
+            self._draw_stub(ctx)
+        if self.notification:
+            self.notification.draw(ctx)
+        self.draw_overlays(ctx)
 
-        ctx.font_size = self._font_size
+    def _draw_button_icon(self, ctx, sprite, bx, by, align="center"):
+        """Draw a single-frame icon sprite at a button position.
+
+        align: 'center' | 'left' | 'right' — horizontal alignment relative to bx.
+        The icon is always vertically centred on by.
+        """
+        if sprite is None:
+            return
+        iw, ih = sprite["w"], sprite["h"]
+        if align == "right":
+            ox = bx - iw
+        elif align == "left":
+            ox = bx
+        else:
+            ox = bx - iw // 2
+        oy = by - ih // 2
+        self._draw_sprite(ctx, 0, 1, ox, oy, sprite=sprite)
+
+    def _draw_sprite(self, ctx, frame_idx, scale, ox, oy, sprite=None):
+        if sprite is None:
+            sprite = self._sprite
+        palette = sprite["palette"]
+        for seg in sprite["frames"][frame_idx]:
+            code, x, y, w = seg
+            r, g, b = palette[code]
+            ctx.rgb(r / 255, g / 255, b / 255)
+            ctx.rectangle(ox + x * scale, oy + y * scale, w * scale, scale).fill()
+
+    def _draw_wrapped_lines(self, ctx, lines, font_size, y_offset=0):
+        ctx.font_size = font_size
+        y_start = -(len(lines) - 1) * font_size / 2 + y_offset
+        for i, line in enumerate(lines):
+            ctx.move_to(0, y_start + i * font_size)
+            ctx.text(line)
+
+    def _draw_home(self, ctx):
+        count = self._fact_count
+        busy = self._fetching or self._fetching_mastodon
+
+        if self._sprite:
+            fw, fh = self._sprite["w"], self._sprite["h"]
+            ox = -(fw * _SPRITE_SCALE) // 2
+            oy = -(fh * _SPRITE_SCALE) // 2 - 25
+            ctx.save()
+            self._draw_sprite(ctx, self._anim_frame, _SPRITE_SCALE, ox, oy)
+            ctx.font_size = small_font_size
+            ctx.text_align = ctx.CENTER
+            ctx.text_baseline = ctx.MIDDLE
+            text_y = oy + fh * _SPRITE_SCALE + 26
+            if busy:
+                ctx.rgb(0.6, 0.6, 0.6)
+                ctx.move_to(0, text_y).text("fetching...")
+            elif count > 0:
+                ctx.rgb(0.35, 0.5, 0.25)
+                ctx.move_to(0, text_y).text(f"quacked: {count}")
+            ctx.restore()
+        else:
+            ctx.save()
+            ctx.font_size = label_font_size
+            ctx.text_align = ctx.CENTER
+            ctx.text_baseline = ctx.MIDDLE
+            ctx.rgb(1, 1, 1)
+            ctx.move_to(0, 0).text("Duck Facts")
+            ctx.restore()
+
+        if not busy:
+            button_labels(ctx)
+            self._draw_back_arrow(ctx)
+            self._draw_button_icon(ctx, self._icon_bolt, 75, -75, align="right")
+            self._draw_button_icon(ctx, self._icon_picture, 75, 75, align="right")
+            self._draw_button_icon(ctx, self._icon_confetti, 0, 100, align="center")
+            if self._mastodon_sprite:
+                mh = self._mastodon_sprite["h"]
+                self._draw_sprite(
+                    ctx, 0, 1, -75, 75 - mh // 2, sprite=self._mastodon_sprite
+                )
+            else:
+                ctx.save()
+                ctx.font_size = small_font_size
+                ctx.text_align = ctx.LEFT
+                ctx.text_baseline = ctx.MIDDLE
+                ctx.rgb(1, 1, 1)
+                ctx.move_to(-75, 75).text("@")
+                ctx.restore()
+
+    def _draw_fact(self, ctx):
+        # Long-press glow behind repeat icon
+        if self._confirm_hold_ms > 200:
+            frac = min(self._confirm_hold_ms / _LONG_PRESS_MS, 1.0)
+            ctx.save()
+            ctx.rgb(frac * 0.6, frac * 0.4, 0)
+            ctx.arc(75, 75, 12, 0, 2 * math.pi, True).fill()
+            ctx.restore()
+
+        ctx.save()
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         ctx.rgb(1, 1, 1)
 
-        if self._wrapped_lines is None:
-            self._wrapped_lines = wrap_text(
-                ctx, self.fact, self._font_size, width=_FACT_WIDTH
-            )
-
-        lines = self._wrapped_lines
-        y_start = -(len(lines) - 1) * self._font_size / 2
-        for i, line in enumerate(lines):
-            ctx.move_to(0, y_start + i * self._font_size)
-            ctx.text(line)
+        if self.fact is None:
+            ctx.font_size = small_font_size
+            ctx.move_to(0, 0).text("No fact yet")
+        else:
+            if self._wrapped_lines is None:
+                self._font_size, self._wrapped_lines = _auto_wrap(
+                    ctx, self.fact, _FACT_MAX_HEIGHT
+                )
+            self._draw_wrapped_lines(ctx, self._wrapped_lines, self._font_size)
 
         ctx.restore()
 
-        if self.notification:
-            self.notification.draw(ctx)
+        self._draw_back_arrow(ctx)
+        self._draw_button_icon(ctx, self._icon_refresh, 75, 75, align="right")
+
+        self._draw_button_icon(ctx, self._icon_heart, -75, 75, align="left")
+
+    def _draw_mastodon(self, ctx):
+        idx = _MASTO_PAGES.index(self._mastodon_sub)
+        has_up = idx > 0
+        has_down = idx < len(_MASTO_PAGES) - 1
+
+        ctx.save()
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        ctx.rgb(1, 1, 1)
+
+        if self._fetching_mastodon:
+            ctx.font_size = small_font_size
+            ctx.move_to(0, 0).text("Fetching @emfducks...")
+        elif self._mastodon_sub == "qr":
+            if self._qr_sprite:
+                scale = 3
+                qw = self._qr_sprite["w"] * scale
+                qh = self._qr_sprite["h"] * scale
+                ox, oy = -qw // 2, -qh // 2
+                ctx.rgb(1, 1, 1)
+                ctx.rectangle(ox, oy, qw, qh).fill()
+                self._draw_sprite(ctx, 0, scale, ox, oy, sprite=self._qr_sprite)
+            else:
+                ctx.font_size = small_font_size
+                ctx.move_to(0, 0).text("@emfducks")
+        elif self._mastodon_sub == "avatar":
+            avatar_path = _ASSET_PATH + "emfducks_avatar.jpg"
+            try:
+                ctx.save()
+                ctx.begin_path()
+                ctx.move_to(_AVATAR_RADIUS, 0)
+                ctx.arc(0, 0, _AVATAR_RADIUS, 0, 2 * math.pi, False)
+                ctx.clip()
+                ctx.image(
+                    avatar_path,
+                    -_AVATAR_RADIUS,
+                    -_AVATAR_RADIUS,
+                    _AVATAR_RADIUS * 2,
+                    _AVATAR_RADIUS * 2,
+                )
+                ctx.restore()
+            except Exception:
+                ctx.font_size = small_font_size
+                ctx.move_to(0, 0).text("@emfducks")
+        elif self._mastodon_sub == "time":
+            ts = self._mastodon_time or ""
+            date_part = ts[:10] if ts else "no date"
+            time_part = ts[11:16] if len(ts) >= 16 else ""
+            ctx.font_size = label_font_size
+            ctx.move_to(0, -20).text("@emfducks")
+            ctx.font_size = small_font_size
+            ctx.rgb(0.65, 0.65, 0.65)
+            ctx.move_to(0, 10).text(date_part)
+            if time_part:
+                ctx.move_to(0, 10 + small_font_size).text(time_part)
+        else:
+            # content
+            post = self._mastodon_post or "No post loaded."
+            if self._mastodon_wrapped is None:
+                self._masto_font, self._mastodon_wrapped = _auto_wrap(
+                    ctx, post, _FACT_MAX_HEIGHT
+                )
+            self._draw_wrapped_lines(ctx, self._mastodon_wrapped, self._masto_font)
+
+        ctx.restore()
+        button_labels(ctx)
+        self._draw_back_arrow(ctx)
+        self._draw_button_icon(ctx, self._icon_refresh, 75, 75, align="right")
+        if has_up:
+            self._draw_up_arrow(ctx)
+        if has_down:
+            self._draw_down_arrow(ctx)
+
+    def _draw_favs(self, ctx):
+        ctx.save()
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+
+        if not self._fav_facts:
+            ctx.font_size = small_font_size
+            ctx.rgb(0.65, 0.65, 0.65)
+            ctx.move_to(0, -12).text("No saved facts yet.")
+            ctx.move_to(0, 12).text("Hold confirm to save.")
+        else:
+            # Counter badge
+            ctx.font_size = small_font_size
+            ctx.rgb(0.4, 0.6, 0.9)
+            ctx.move_to(0, -90).text(f"{self._fav_index + 1} / {len(self._fav_facts)}")
+
+            fact = self._fav_facts[self._fav_index]
+            if self._fav_wrapped is None:
+                self._fav_font, self._fav_wrapped = _auto_wrap(
+                    ctx, fact, 150  # leave room for counter above
+                )
+
+            ctx.rgb(1, 1, 1)
+            self._draw_wrapped_lines(ctx, self._fav_wrapped, self._fav_font, y_offset=5)
+
+        ctx.restore()
+        button_labels(ctx)
+        self._draw_back_arrow(ctx)
+        if len(self._fav_facts) > 1:
+            if self._fav_index > 0:
+                self._draw_up_arrow(ctx)
+            if self._fav_index < len(self._fav_facts) - 1:
+                self._draw_down_arrow(ctx)
+
+    def _draw_back_arrow(self, ctx):
+        """Filled left-pointing arrow at the CANCEL button position (-75, -75)."""
+        ctx.save()
+        ctx.rgb(1, 1, 1)
+        ctx.begin_path()
+        ctx.move_to(-75, -75)
+        ctx.line_to(-68, -83)
+        ctx.line_to(-68, -78)
+        ctx.line_to(-61, -78)
+        ctx.line_to(-61, -72)
+        ctx.line_to(-68, -72)
+        ctx.line_to(-68, -67)
+        ctx.close_path()
+        ctx.fill()
+        ctx.restore()
+
+    def _draw_up_arrow(self, ctx):
+        """Filled upward arrow at the UP button position (0, -100)."""
+        ctx.save()
+        ctx.rgb(1, 1, 1)
+        ctx.begin_path()
+        ctx.move_to(0, -108)
+        ctx.line_to(-7, -100)
+        ctx.line_to(-2, -100)
+        ctx.line_to(-2, -92)
+        ctx.line_to(2, -92)
+        ctx.line_to(2, -100)
+        ctx.line_to(7, -100)
+        ctx.close_path()
+        ctx.fill()
+        ctx.restore()
+
+    def _draw_down_arrow(self, ctx):
+        """Filled downward arrow at the DOWN button position (0, 100)."""
+        ctx.save()
+        ctx.rgb(1, 1, 1)
+        ctx.begin_path()
+        ctx.move_to(0, 108)
+        ctx.line_to(7, 100)
+        ctx.line_to(2, 100)
+        ctx.line_to(2, 92)
+        ctx.line_to(-2, 92)
+        ctx.line_to(-2, 100)
+        ctx.line_to(-7, 100)
+        ctx.close_path()
+        ctx.fill()
+        ctx.restore()
+
+    def _draw_leds(self, ctx):
+        # Twinkling stars in party-mode colours
+        sc = self._party["star_colours"]
+        for star in self._stars:
+            brightness = (math.sin(star[2]) + 1) / 2
+            sr, sg, sb = sc[star[4]]
+            ctx.rgb(sr / 255 * brightness, sg / 255 * brightness, sb / 255 * brightness)
+            size = 2 if brightness > 0.65 else 1
+            ctx.rectangle(star[0], star[1], size, size).fill()
+            star[2] = (star[2] + star[3]) % 6.284
+
+        ctx.save()
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+
+        tr, tg, tb = self._party["title_rgb"]
+        sr, sg, sb = self._party["subtitle_rgb"]
+        subtitle = self._party["subtitle"]
+
+        if self._sprite:
+            fw, fh = self._sprite["w"], self._sprite["h"]
+            ox = -(fw * _SPRITE_SCALE) // 2
+            oy = -(fh * _SPRITE_SCALE) // 2 - 10
+
+            ctx.font_size = label_font_size
+            ctx.rgb(tr, tg, tb)
+            ctx.move_to(0, oy - 20).text("DUCK PARTY")
+
+            self._draw_sprite(ctx, self._anim_frame, _SPRITE_SCALE, ox, oy)
+
+            ctx.font_size = label_font_size
+            ctx.rgb(sr, sg, sb)
+            ctx.move_to(0, oy + fh * _SPRITE_SCALE + 20).text(subtitle)
+        else:
+            ctx.font_size = label_font_size
+            ctx.rgb(tr, tg, tb)
+            ctx.move_to(0, -20).text("DUCK PARTY")
+            ctx.rgb(sr, sg, sb)
+            ctx.move_to(0, 20).text(subtitle)
+
+        ctx.restore()
+
+    def _draw_stub(self, ctx):
+        label = _STUB_LABELS.get(self._view, "Coming soon")
+        ctx.save()
+        ctx.font_size = label_font_size
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        ctx.rgb(1, 1, 1)
+        ctx.move_to(0, -10).text(label)
+        ctx.font_size = small_font_size
+        ctx.rgb(0.5, 0.5, 0.5)
+        ctx.move_to(0, 15).text("coming soon")
+        ctx.restore()
+        button_labels(ctx)
+        self._draw_back_arrow(ctx)
 
 
 __app_export__ = DuckFactsApp
