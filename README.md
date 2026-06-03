@@ -30,7 +30,7 @@ This app has nothing to do with the following image (but, a fully-functional duc
 - Button icons via [Flaticon](https://www.flaticon.com/).
 
 - Live fact data from the [duck facts API](https://03vpefsitf.execute-api.eu-west-1.amazonaws.com/prod/) (thank you to whoever is still running this!).
-- Live duck images from <https://ducks.now/> via <https://wsrv.nl/> for resizing.
+- Live duck images from <https://ducks.now/> and <https://random-d.uk/>, via <https://wsrv.nl/> for resizing.
 - Stored/local fact data from [bjorn-knudsen duck facts bot](https://github.com/bjorn-knudsen/duck-facts-bot/blob/main/duck_facts.txt).
 
 

@@ -568,21 +568,70 @@ class DuckFactsApp(app.App):
             headers = {
                 "User-Agent": "tildagon-duck-facts"
             }
-            resp = await async_helpers.unblock(
-                requests.get,
-                render_update,
-                "https://ducks.now/api/v0/random/",
-                headers=headers
-            )
-            data = None
-            try:
-                if resp.status_code == 200:
-                    data = resp.json()
-            finally:
-                resp.close()
+            use_random_duk = (random.randint(0, 1) == 1)
+            download_url = None
+            title = "Duck"
+            description = "No description"
+            attrib = "Unknown"
+            lic = "Unknown"
 
-            if data and data.get("download_url"):
-                download_url = data.get("download_url")
+            for attempt in range(2):
+                data = None
+                if use_random_duk:
+                    resp = await async_helpers.unblock(
+                        requests.get,
+                        render_update,
+                        "https://random-d.uk/api/v2/quack",
+                        headers=headers
+                    )
+                    try:
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if data and data.get("url"):
+                                download_url = data.get("url")
+                                try:
+                                    fn = download_url.split("/")[-1].split(".")[0]
+                                    title = f"Duck #{fn}" if fn.isdigit() else "Random Duck"
+                                except Exception:
+                                    title = "Random Duck"
+                                description = "A lovely random duck"
+                                attrib = "random-d.uk"
+                                lic = "Various"
+                    finally:
+                        resp.close()
+                else:
+                    resp = await async_helpers.unblock(
+                        requests.get,
+                        render_update,
+                        "https://ducks.now/api/v0/random/",
+                        headers=headers
+                    )
+                    try:
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if data and data.get("download_url"):
+                                download_url = data.get("download_url")
+                                title = data.get("title", "Duck")
+                                description = data.get("description", "No description")
+                                attrib = data.get("attribution_name", "Unknown")
+                                lic = data.get("attribution_license", "Unknown")
+                                if "Creative Commons" in lic:
+                                    lic = lic.replace("Creative Commons", "CC")
+                                    lic = lic.replace("Attribution-Share Alike", "BY-SA")
+                                    lic = lic.replace("Attribution", "BY")
+                                    lic = lic.replace("International", "")
+                                    lic = lic.replace("License", "")
+                                    lic = lic.strip()
+                                elif lic == "Public domain":
+                                    lic = "PD"
+                    finally:
+                        resp.close()
+
+                if download_url:
+                    break
+                use_random_duk = not use_random_duk
+
+            if download_url:
                 proxy_url = f"https://wsrv.nl/?url={download_url}&w=150&h=150&output=jpg&q=80"
                 img_resp = await async_helpers.unblock(
                     requests.get,
@@ -622,19 +671,9 @@ class DuckFactsApp(app.App):
                                 except Exception:
                                     pass
 
-                            self._photo_title = data.get("title", "Duck")
-                            self._photo_description = data.get("description", "No description")
-                            self._photo_attribution = data.get("attribution_name", "Unknown")
-                            lic = data.get("attribution_license", "Unknown")
-                            if "Creative Commons" in lic:
-                                lic = lic.replace("Creative Commons", "CC")
-                                lic = lic.replace("Attribution-Share Alike", "BY-SA")
-                                lic = lic.replace("Attribution", "BY")
-                                lic = lic.replace("International", "")
-                                lic = lic.replace("License", "")
-                                lic = lic.strip()
-                            elif lic == "Public domain":
-                                lic = "PD"
+                            self._photo_title = title
+                            self._photo_description = description
+                            self._photo_attribution = attrib
                             self._photo_license = lic
 
                             settings.set("duckfacts_photo_title", self._photo_title)
@@ -1362,9 +1401,10 @@ class DuckFactsApp(app.App):
         ctx.font_size = small_font_size
 
         if self._credits_page == 0:
-            ctx.move_to(0, -30).text("caz-bee (sprites)")
-            ctx.move_to(0, 10).text("starwatchers-studio")
-            ctx.move_to(0, 50).text("ducks.now (photos)")
+            ctx.move_to(0, -45).text("caz-bee (sprites)")
+            ctx.move_to(0, -15).text("starwatchers-studio")
+            ctx.move_to(0, 15).text("ducks.now (photos)")
+            ctx.move_to(0, 45).text("random-d.uk (photos)")
         elif self._credits_page == 1:
             ctx.move_to(0, -30).text("wsrv.nl (image proxy)")
             ctx.move_to(0, 10).text("Flaticon (icons)")

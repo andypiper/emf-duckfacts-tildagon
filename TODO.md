@@ -11,6 +11,8 @@
 - **change background colour based on badge space theme**
 - **some kind of astroduck thing**
 - Inter-badge sharing
+- obviously, I should be in it somewhere.
+
 
 ## Done (recent)
 
