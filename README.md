@@ -6,11 +6,22 @@ Some facts about ducks 🦆
 
 Inspired by [@emfducks](https://mastodon.social/@emfducks) (but not endorsed by them).
 
-Wants to be on wifi to grab facts and hunt for duck images, but has some offline content too.
+Wants to be on wifi to grab facts and hunt for duck images, but has some offline content for when you just need a duck fix.
+
+Enjoy several modes of ducky fun:
+
+- Duck Fact
+- Duck Hunt
+- Duck Party
+- Duck Toot
 
 Shake it! Explore it! Save your favourite facts! Check out @emfducks' latest quack!
 
-This app has nothing to do with the following image (but, a fully-functional duck #hexpansion must clearly be created before 2026).
+![App screenshot](./screenshot.png)
+
+![Live app](./badgeshot.jpg)
+
+This app has nothing to do with the following image (but, a fully-functional duck #hexpansion must clearly be created).
 
 ![Duck pond](https://tildagon.badge.emfcamp.org/images/hexpansions/duckpond.jpg)
 

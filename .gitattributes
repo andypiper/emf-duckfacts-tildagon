@@ -4,6 +4,8 @@ TODO.md export-ignore
 Justfile export-ignore
 LICENSE export-ignore
 README.md export-ignore
+badgeshot.jpg export-ignore
+screenshot.png export-ignore
 duckies/ export-ignore
 icon-svgs/ export-ignore
 tools/ export-ignore
