@@ -25,7 +25,7 @@ install:
     mpremote connect {{device}} cp app.py {{badge_app_dir}}/
     mpremote connect {{device}} reset
 
-# Install only python source and metadata files to the badge (much faster)
+# Install only python source and metadata files to the badge
 install-code:
     mpremote connect {{device}} cp app.py {{badge_app_dir}}/
     mpremote connect {{device}} reset
