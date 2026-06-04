@@ -23,7 +23,6 @@ from tildagonos import tildagonos
 
 try:
     import imu as _imu
-
     _HAS_IMU = True
 except ImportError:
     _HAS_IMU = False
@@ -93,11 +92,32 @@ _DUCK_LED_MAP = {
 
 _NON_QUACK = ["*honk*", "*hiss*", "*whistle*", "*squeak*", "*coo*"]
 
+_PHOTO_LOADING_PHRASES = [
+    "Looking for ducks...",
+    "Finding a duck...",
+    "Duck Hunting",
+    "One moment please...",
+    "Quackspotting",
+    "Wildfowl sighted...",
+    "Scanning the pond...",
+    "Duck radar active...",
+    "Awaiting quacks!",
+    "Checking the reeds",
+    "Pond patrol...",
+    "Consulting mallards...",
+    "Wait for a duck",
+    "Looking at the lake",
+    "Ruffling feathers...",
+    "Binoculars active",
+    "Locating Anatidae...",
+    "Duck Season!"
+]
+
 # Party mode themes for the DUCK PARTY lights screen.
 # Switch via: settings.set("duckfacts_party", "2024") / settings.save()
-# Default is "2026"
+# Defaults to "2026"
 _PARTY_2026 = "2026"
-_PARTY_2024 = "2024"  # easter egg
+_PARTY_2024 = "2024"
 
 # 2026 star colours: #F77F02 orange, #F9E200 yellow, white
 # LED rotation always follows the loaded duck's colour scheme (self._duck_leds).
@@ -166,7 +186,6 @@ else:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
-
 
 def _feistiness_colour(rating):
     if rating < 34:
@@ -283,7 +302,6 @@ def _auto_wrap(ctx, text, max_height, width=_FACT_WIDTH):
 # App
 # ---------------------------------------------------------------------------
 
-
 class DuckFactsApp(app.App):
     def __init__(self):
         super().__init__()
@@ -307,9 +325,9 @@ class DuckFactsApp(app.App):
         self._should_fetch_photo = False
         self._photo_path = settings.get("duckfacts_photo_path", _ASSET_PATH + "duck_photo.jpg")
         self._photo_title = settings.get("duckfacts_photo_title", "Rubber Duck")
-        self._photo_description = settings.get("duckfacts_photo_description", "A rubber duck render")
+        self._photo_description = settings.get("duckfacts_photo_description", "Just, you know, a duck.")
         self._photo_attribution = settings.get("duckfacts_photo_attribution", "starwatchers-studio")
-        self._photo_license = settings.get("duckfacts_photo_license", "CC0")
+        self._photo_license = settings.get("duckfacts_photo_license", "via itch.io")
         self._photo_sub = "image"
         self._photo_wrapped_title = None
         self._photo_title_font = small_font_size
@@ -317,6 +335,7 @@ class DuckFactsApp(app.App):
         self._photo_attrib_font = small_font_size
         self._photo_wrapped_desc = None
         self._photo_desc_font = small_font_size
+        self._photo_loading_text = "Looking for ducks..."
 
         # Long-press for favourites / systems
         self._confirm_hold_ms = 0
@@ -326,6 +345,7 @@ class DuckFactsApp(app.App):
         self._up_hold_ms = 0
         self._up_was_held = False
         self._credits_page = 0
+        self._credits_secret_unlocked = False
 
         # Shake-to-fact (local facts)
         self._shake_cooldown = 0
@@ -379,7 +399,7 @@ class DuckFactsApp(app.App):
         self._anim_frame = 0
         self._anim_timer = _ANIM_MS
 
-        # Party mode — readable via REPL: settings.set("duckfacts_party","2024")
+        # Party mode configuration
         self._party = _PARTY_MODES.get(
             settings.get("duckfacts_party", _PARTY_2026),
             _PARTY_MODES[_PARTY_2026],
@@ -562,6 +582,7 @@ class DuckFactsApp(app.App):
 
     async def _fetch_photo(self, render_update):
         self._fetching_photo = True
+        self._photo_loading_text = random.choice(_PHOTO_LOADING_PHRASES)
         eventbus.emit(PatternDisable())
         await render_update()
         try:
@@ -934,12 +955,24 @@ class DuckFactsApp(app.App):
                     self._should_fetch_photo = True
 
         elif self._view == _CREDITS:
+            if _HAS_IMU:
+                try:
+                    acc = _imu.acc_read()
+                    mag = math.sqrt(acc[0] ** 2 + acc[1] ** 2 + acc[2] ** 2)
+                    if abs(mag - self._last_magnitude) > 5.0:
+                        self._credits_secret_unlocked = True
+                        self._credits_page = 2
+                    self._last_magnitude = mag
+                except Exception:
+                    pass
+
+            max_page = 2 if self._credits_secret_unlocked else 1
             if self.button_states.get(BUTTON_TYPES["UP"]):
                 self.button_states.clear()
                 self._credits_page = max(0, self._credits_page - 1)
             elif self.button_states.get(BUTTON_TYPES["DOWN"]):
                 self.button_states.clear()
-                self._credits_page = min(2, self._credits_page + 1)
+                self._credits_page = min(max_page, self._credits_page + 1)
 
         elif self._view == _PROMPT_CLEAR:
             confirm = self.button_states.get(BUTTON_TYPES["CONFIRM"])
@@ -1317,7 +1350,7 @@ class DuckFactsApp(app.App):
 
         if self._fetching_photo:
             ctx.font_size = small_font_size
-            ctx.move_to(0, 0).text("Looking for ducks...")
+            ctx.move_to(0, 0).text(self._photo_loading_text)
             ctx.restore()
             button_labels(ctx)
             self._draw_back_arrow(ctx)
@@ -1395,29 +1428,35 @@ class DuckFactsApp(app.App):
 
         ctx.rgb(0.4, 0.6, 0.9)
         ctx.font_size = label_font_size
-        ctx.move_to(0, -75).text("Thanks!")
+        if self._credits_page == 2:
+            ctx.move_to(0, -75).text("Creator")
+        else:
+            ctx.move_to(0, -75).text("Thanks!")
 
         ctx.rgb(1, 1, 1)
         ctx.font_size = small_font_size
 
         if self._credits_page == 0:
-            ctx.move_to(0, -45).text("caz-bee (sprites)")
-            ctx.move_to(0, -15).text("starwatchers-studio")
-            ctx.move_to(0, 15).text("ducks.now (photos)")
-            ctx.move_to(0, 45).text("random-d.uk (photos)")
+            ctx.move_to(0, -30).text("@emfducks")
+            ctx.move_to(0, 10).text("caz-bee (sprites)")
+            ctx.move_to(0, 50).text("starwatchers-studio")
         elif self._credits_page == 1:
-            ctx.move_to(0, -30).text("wsrv.nl (image proxy)")
-            ctx.move_to(0, 10).text("Flaticon (icons)")
-            ctx.move_to(0, 50).text("@emfducks")
-        else:
-            ctx.move_to(0, -30).text("Anon duck facts API")
-            ctx.move_to(0, 10).text("bjorn-knudsen (more facts)")
+            ctx.move_to(0, -45).text("ducks.now (photos)")
+            ctx.move_to(0, -15).text("random-d.uk (photos)")
+            ctx.move_to(0, 15).text("Anon duck facts API")
+            ctx.move_to(0, 45).text("bjorn-knudsen (facts)")
+        elif self._credits_page == 2:
+            ctx.move_to(0, -30).text("An App by Andy Piper")
+            ctx.move_to(0, 10).text("@andypiper@macaw.social")
+            ctx.move_to(0, 50).text("You're very welcome.")
 
         ctx.restore()
 
         if self._credits_page > 0:
             self._draw_up_arrow(ctx)
-        if self._credits_page < 2:
+
+        max_page = 2 if self._credits_secret_unlocked else 1
+        if self._credits_page < max_page:
             self._draw_down_arrow(ctx)
 
         self._draw_back_arrow(ctx)
