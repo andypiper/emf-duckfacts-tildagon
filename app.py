@@ -325,7 +325,7 @@ class DuckFactsApp(app.App):
         self._should_fetch_photo = False
         self._photo_path = settings.get("duckfacts_photo_path", _ASSET_PATH + "duck_photo.jpg")
         self._photo_title = settings.get("duckfacts_photo_title", "Rubber Duck")
-        self._photo_description = settings.get("duckfacts_photo_description", "Just, you know, a duck.")
+        self._photo_description = settings.get("duckfacts_photo_description", "Just, you know, a duck. Use the binoculars to look for another one.")
         self._photo_attribution = settings.get("duckfacts_photo_attribution", "starwatchers-studio")
         self._photo_license = settings.get("duckfacts_photo_license", "via itch.io")
         self._photo_sub = "image"
