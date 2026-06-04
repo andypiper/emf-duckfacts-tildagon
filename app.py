@@ -459,6 +459,19 @@ class DuckFactsApp(app.App):
         # Cached display values
         self._fact_count = settings.get("duckfacts_count", 0)
 
+        # Cleanup orphaned photo files from assets/
+        try:
+            active_photo_filename = self._photo_path.split("/")[-1]
+            for f in os.listdir(_ASSET_PATH):
+                if f.startswith("duck_photo_") and f.endswith(".jpg"):
+                    if f != active_photo_filename:
+                        try:
+                            os.remove(_ASSET_PATH + f)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
     # -----------------------------------------------------------------------
     # Async loop
     # -----------------------------------------------------------------------
